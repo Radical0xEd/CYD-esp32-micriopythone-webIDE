@@ -1,0 +1,501 @@
+import network
+import socket
+import ujson
+import os
+import gc
+import time
+import machine
+from machine import Pin, SPI
+import uselect
+import sys
+import io
+
+# Try to import display libraries (install with upip if available)
+try:
+    import st7789
+    import tft_config
+    HAS_DISPLAY = True
+except ImportError:
+    HAS_DISPLAY = False
+    print("Display libraries not found - running headless")
+
+class MicroPythonConsole:
+    def __init__(self):
+        self.ap_ssid = "ESP32-PyConsole"
+        self.ap_password = "12345678"
+        self.scripts = {}
+        self.max_scripts = 10
+        self.setup_display()
+        self.setup_wifi()
+        self.setup_filesystem()
+        self.load_scripts()
+        
+    def setup_display(self):
+        """Initialize TFT display if available"""
+        if HAS_DISPLAY:
+            try:
+                self.tft = st7789.ST7789(
+                    SPI(2, baudrate=40000000, polarity=1, phase=0, sck=Pin(14), mosi=Pin(13)),
+                    320, 240,
+                    reset=Pin(23, Pin.OUT),
+                    cs=Pin(15, Pin.OUT),
+                    dc=Pin(2, Pin.OUT),
+                    backlight=Pin(21, Pin.OUT),
+                    rotation=1
+                )
+                self.display_message("ESP32 Python Console", "Initializing...")
+            except Exception as e:
+                print(f"Display init failed: {e}")
+                HAS_DISPLAY = False
+        
+    def display_message(self, title, message):
+        """Display message on TFT screen"""
+        if HAS_DISPLAY and hasattr(self, 'tft'):
+            try:
+                self.tft.fill(st7789.BLACK)
+                self.tft.text(title, 10, 10, st7789.WHITE)
+                self.tft.text(message, 10, 30, st7789.WHITE)
+            except:
+                pass
+                
+    def setup_wifi(self):
+        """Setup WiFi Access Point"""
+        self.ap = network.WLAN(network.AP_IF)
+        self.ap.active(True)
+        self.ap.config(essid=self.ap_ssid, password=self.ap_password)
+        
+        while not self.ap.active():
+            time.sleep(0.1)
+            
+        print(f"AP started: {self.ap_ssid}")
+        print(f"IP: {self.ap.ifconfig()[0]}")
+        
+        if HAS_DISPLAY:
+            self.display_message("WiFi AP Started", f"IP: {self.ap.ifconfig()[0]}")
+    
+    def setup_filesystem(self):
+        """Ensure scripts directory exists"""
+        try:
+            os.mkdir('scripts')
+        except OSError:
+            pass  # Directory already exists
+    
+    def load_scripts(self):
+        """Load saved Python scripts from filesystem"""
+        self.scripts = {}
+        try:
+            files = os.listdir('scripts')
+            for filename in files:
+                if filename.endswith('.py'):
+                    script_name = filename[:-3]
+                    try:
+                        with open(f'scripts/{filename}', 'r') as f:
+                            self.scripts[script_name] = f.read()
+                        print(f"Loaded script: {script_name}")
+                    except Exception as e:
+                        print(f"Error loading {filename}: {e}")
+        except OSError:
+            print("No scripts directory found")
+            
+        print(f"Total scripts loaded: {len(self.scripts)}")
+    
+    def save_script(self, name, code):
+        """Save Python script to filesystem"""
+        try:
+            with open(f'scripts/{name}.py', 'w') as f:
+                f.write(code)
+            self.scripts[name] = code
+            return True
+        except Exception as e:
+            print(f"Error saving script {name}: {e}")
+            return False
+    
+    def delete_script(self, name):
+        """Delete script from filesystem and memory"""
+        try:
+            os.remove(f'scripts/{name}.py')
+            if name in self.scripts:
+                del self.scripts[name]
+            return True
+        except Exception as e:
+            print(f"Error deleting script {name}: {e}")
+            return False
+    
+    def execute_python_code(self, code):
+        """Execute Python code and capture output"""
+        output = []
+        error = None
+        
+        # Redirect stdout to capture print statements
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        
+        try:
+            # Create string buffer to capture output
+            stdout_buffer = io.StringIO()
+            stderr_buffer = io.StringIO()
+            
+            sys.stdout = stdout_buffer
+            sys.stderr = stderr_buffer
+            
+            # Execute the code
+            exec(code, {"__name__": "__main__", "machine": machine, "time": time, "gc": gc})
+            
+            # Get captured output
+            stdout_content = stdout_buffer.getvalue()
+            stderr_content = stderr_buffer.getvalue()
+            
+            if stdout_content:
+                output.append(stdout_content)
+            if stderr_content:
+                error = stderr_content
+                
+        except Exception as e:
+            error = str(e)
+        finally:
+            # Restore stdout/stderr
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            
+        return output, error
+    
+    def get_system_info(self):
+        """Get system information"""
+        return {
+            "free_memory": gc.mem_free(),
+            "allocated_memory": gc.mem_alloc(),
+            "flash_size": "Unknown",  # Not easily available in MicroPython
+            "frequency": machine.freq(),
+            "scripts_count": len(self.scripts),
+            "uptime": time.ticks_ms() // 1000
+        }
+    
+    def create_web_page(self):
+        """Generate the web interface HTML"""
+        return '''<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 MicroPython Console</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: 'Courier New', monospace; margin: 20px; background: #0d1117; color: #c9d1d9; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        .header { text-align: center; margin-bottom: 30px; border-bottom: 2px solid #21262d; padding-bottom: 20px; }
+        .header h1 { color: #58a6ff; margin: 0; }
+        .header p { color: #8b949e; margin: 5px 0; }
+        .console-area { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin: 20px 0; }
+        .console-area h3 { color: #f0f6fc; margin-top: 0; }
+        textarea { width: 100%; height: 250px; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 12px; font-family: 'Courier New', monospace; font-size: 14px; resize: vertical; }
+        button { background: #238636; color: #ffffff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; margin: 5px; font-size: 14px; }
+        button:hover { background: #2ea043; }
+        .danger { background: #da3633; }
+        .danger:hover { background: #f85149; }
+        .secondary { background: #21262d; }
+        .secondary:hover { background: #30363d; }
+        .output { background: #010409; color: #7ce38b; border: 1px solid #30363d; border-radius: 6px; padding: 15px; margin: 15px 0; font-family: 'Courier New', monospace; font-size: 13px; min-height: 120px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; }
+        .error { color: #f85149; }
+        .script-list { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin: 20px 0; }
+        .script-item { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 15px; margin: 10px 0; cursor: pointer; transition: background 0.2s; }
+        .script-item:hover { background: #161b22; border-color: #58a6ff; }
+        .script-name { color: #58a6ff; font-weight: bold; margin-bottom: 5px; }
+        .script-preview { color: #8b949e; font-size: 12px; }
+        input[type="text"] { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; margin: 5px; font-size: 14px; }
+        .status-bar { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 15px; margin: 20px 0; display: flex; justify-content: space-between; flex-wrap: wrap; }
+        .status-item { margin: 5px; }
+        .status-label { color: #8b949e; font-size: 12px; }
+        .status-value { color: #f0f6fc; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🐍 ESP32 MicroPython Console</h1>
+            <p>Execute Python code directly on the ESP32 microcontroller</p>
+        </div>
+        
+        <div id="statusBar" class="status-bar">
+            <div class="status-item">
+                <div class="status-label">Memory Free</div>
+                <div class="status-value" id="memoryFree">Loading...</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">Scripts</div>
+                <div class="status-value" id="scriptCount">0</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">CPU Freq</div>
+                <div class="status-value" id="cpuFreq">Loading...</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">Uptime</div>
+                <div class="status-value" id="uptime">0s</div>
+            </div>
+        </div>
+        
+        <div class="console-area">
+            <h3>Python Code Editor</h3>
+            <textarea id="codeInput" placeholder="Enter your MicroPython code here...">
+# Example: Hardware control and system info
+import machine
+import time
+import gc
+
+# Print system information
+print("=== ESP32 System Info ===")
+print(f"Free memory: {gc.mem_free()} bytes")
+print(f"CPU frequency: {machine.freq()} Hz")
+print(f"Uptime: {time.ticks_ms() // 1000} seconds")
+
+# Example LED control (if LED connected to pin 2)
+try:
+    led = machine.Pin(2, machine.Pin.OUT)
+    print("\\nBlinking LED...")
+    for i in range(3):
+        led.on()
+        time.sleep_ms(200)
+        led.off()
+        time.sleep_ms(200)
+        print(f"Blink {i+1}")
+    print("LED demo complete")
+except Exception as e:
+    print(f"LED demo failed: {e}")
+
+# Network scan example
+print("\\n=== Network Operations ===")
+import network
+sta = network.WLAN(network.STA_IF)
+print(f"WiFi status: {'Active' if sta.active() else 'Inactive'}")
+            </textarea>
+            <br>
+            <button onclick="executeCode()">▶️ Execute Code</button>
+            <button onclick="clearOutput()" class="secondary">🗑️ Clear Output</button>
+            <button onclick="clearCode()" class="secondary">📝 Clear Code</button>
+            <button onclick="insertTemplate()" class="secondary">📄 Load Template</button>
+        </div>
+        
+        <div class="console-area">
+            <h3>Output Console</h3>
+            <div id="output" class="output">Ready for Python code execution...</div>
+        </div>
+        
+        <div class="console-area">
+            <h3>Script Management</h3>
+            <input type="text" id="scriptName" placeholder="Script name (e.g., 'led_blink')">
+            <button onclick="saveScript()">💾 Save Script</button>
+            <button onclick="loadScripts()" class="secondary">🔄 Refresh</button>
+            <button onclick="clearAllScripts()" class="danger">⚠️ Clear All</button>
+            <div id="scriptList" class="script-list"></div>
+        </div>
+    </div>
+
+    <script>
+        function executeCode() {
+            const code = document.getElementById('codeInput').value;
+            const output = document.getElementById('output');
+            
+            output.innerHTML += '>>> Executing Python code...\\n';
+            
+            fetch('/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code: code })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.output && data.output.length > 0) {
+                    data.output.forEach(line => {
+                        output.innerHTML += line + '\\n';
+                    });
+                }
+                if (data.error) {
+                    output.innerHTML += '<span class="error">ERROR: ' + data.error + '</span>\\n';
+                }
+                output.innerHTML += '>>> Code execution complete\\n\\n';
+                output.scrollTop = output.scrollHeight;
+            })
+            .catch(error => {
+                output.innerHTML += '<span class="error">Connection error: ' + error + '</span>\\n';
+                output.scrollTop = output.scrollHeight;
+            });
+        }
+        
+        function clearOutput() {
+            document.getElementById('output').innerHTML = 'Console cleared...\\n';
+        }
+        
+        function clearCode() {
+            document.getElementById('codeInput').value = '';
+        }
+        
+        function insertTemplate() {
+            const template = `# MicroPython Hardware Template
+import machine
+import time
+
+# GPIO pins
+led = machine.Pin(2, machine.Pin.OUT)
+button = machine.Pin(0, machine.Pin.IN, machine.Pin.PULL_UP)
+
+# Simple blink
+for i in range(5):
+    led.value(not led.value())
+    print(f"LED state: {led.value()}")
+    time.sleep_ms(500)
+
+print("Template execution complete")`;
+            document.getElementById('codeInput').value = template;
+        }
+        
+        function saveScript() {
+            const name = document.getElementById('scriptName').value.trim();
+            const code = document.getElementById('codeInput').value;
+            
+            if (!name || !code) {
+                alert('Please enter both script name and code');
+                return;
+            }
+            
+            fetch('/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: name, code: code })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert('Script saved successfully!');
+                    document.getElementById('scriptName').value = '';
+                    loadScripts();
+                } else {
+                    alert('Error saving script: ' + data.error);
+                }
+            });
+        }
+        
+        function loadScripts() {
+            fetch('/scripts')
+                .then(response => response.json())
+                .then(data => {
+                    const scriptList = document.getElementById('scriptList');
+                    scriptList.innerHTML = '<h4>📚 Saved Scripts:</h4>';
+                    
+                    if (Object.keys(data.scripts).length === 0) {
+                        scriptList.innerHTML += '<p style="color: #8b949e;">No saved scripts</p>';
+                        return;
+                    }
+                    
+                    for (const [name, code] of Object.entries(data.scripts)) {
+                        const div = document.createElement('div');
+                        div.className = 'script-item';
+                        div.innerHTML = `
+                            <div class="script-name">${name}</div>
+                            <div class="script-preview">${code.substring(0, 100)}${code.length > 100 ? '...' : ''}</div>
+                        `;
+                        div.onclick = () => loadScript(name);
+                        scriptList.appendChild(div);
+                    }
+                    
+                    document.getElementById('scriptCount').textContent = Object.keys(data.scripts).length;
+                });
+        }
+        
+        function loadScript(name) {
+            fetch(`/load?name=${encodeURIComponent(name)}`)
+                .then(response => response.text())
+                .then(code => {
+                    document.getElementById('codeInput').value = code;
+                    document.getElementById('output').innerHTML += `>>> Loaded script: ${name}\\n`;
+                });
+        }
+        
+        function clearAllScripts() {
+            if (confirm('Are you sure you want to delete ALL saved scripts? This cannot be undone.')) {
+                fetch('/clear_all', { method: 'POST' })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            alert('All scripts cleared');
+                            loadScripts();
+                        }
+                    });
+            }
+        }
+        
+        function updateStatus() {
+            fetch('/status')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('memoryFree').textContent = Math.round(data.free_memory / 1024) + ' KB';
+                    document.getElementById('cpuFreq').textContent = Math.round(data.frequency / 1000000) + ' MHz';
+                    document.getElementById('uptime').textContent = data.uptime + 's';
+                });
+        }
+        
+        // Initialize page
+        loadScripts();
+        updateStatus();
+        setInterval(updateStatus, 5000); // Update every 5 seconds
+    </script>
+</body>
+</html>'''
+    
+    def handle_request(self, client_socket):
+        """Handle incoming HTTP requests"""
+        try:
+            request = client_socket.recv(1024).decode('utf-8')
+            
+            # Parse request
+            lines = request.split('\n')
+            if len(lines) == 0:
+                return
+                
+            request_line = lines[0]
+            method, path, _ = request_line.split(' ')
+            
+            # Get POST data if present
+            post_data = None
+            if method == 'POST':
+                content_length = 0
+                for line in lines:
+                    if line.lower().startswith('content-length:'):
+                        content_length = int(line.split(':')[1].strip())
+                        break
+                
+                if content_length > 0:
+                    # Find empty line separating headers from body
+                    body_start = request.find('\r\n\r\n')
+                    if body_start != -1:
+                        post_data = request[body_start + 4:body_start + 4 + content_length]
+            
+            # Route handling
+            if path == '/':
+                response = self.create_web_page()
+                self.send_response(client_socket, response, 'text/html')
+                
+            elif path == '/execute' and method == 'POST':
+                if post_data:
+                    data = ujson.loads(post_data)
+                    code = data.get('code', '')
+                    output, error = self.execute_python_code(code)
+                    result = {'output': output, 'error': error}
+                    self.send_response(client_socket, ujson.dumps(result), 'application/json')
+                    
+            elif path == '/save' and method == 'POST':
+                if post_data:
+                    data = ujson.loads(post_data)
+                    name = data.get('name', '')
+                    code = data.get('code', '')
+                    success = self.save_script(name, code)
+                    result = {'success': success}
+                    self.send_response(client_socket, ujson.dumps(result), 'application/json')
+                    
+            elif path.startswith('/load'):
+                name = path.split('name=')[1] if 'name=' in path else ''
+                if name in self.scripts:
+                    self.send_response(client_socket, self.scripts[name], 'text/plain')
+                else:
+                    self.send_response(client_socket, 'Script not found', 'text/plain', 404)
+                    
+            elif path == '/scripts':
+                result = {'scripts': self.scripts}
+           
